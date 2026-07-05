@@ -1,7 +1,15 @@
 /**
  * ============================================================
- * RELAY — 依頼受付・整理・受渡エージェント (GAS) v2
+ * RELAY — 依頼受付・整理・受渡エージェント (GAS) v3
  * ============================================================
+ * v2 からの変更点:
+ *   [修正] Gemini 既定モデルを gemini-3.5-flash に更新
+ *          （gemini-2.0-flash は 2026-06-01 提供終了。HTTP 404 の原因）。
+ *   [追加] readDriveText_ を MIME 対応化: Googleドキュメントは
+ *          DocumentApp で本文抽出、docx/zip 形式は明示エラー。
+ *   [追加] inspectConstitutionFiles(): 憲法ファイルの名称・MIME・
+ *          サイズ・冒頭200文字をログ出力する診断関数。
+ *
  * v1 からの変更点:
  *   [修正] testPipeline: NG 時に早期 return して Logger.log を通らず
  *          「OKもNGも出ない」状態になるバグを修正。各段階で即時ログ出力。
@@ -15,7 +23,7 @@
  *   STYLE_DELTA_FILE_ID    任意  Drive 上の STYLE_DELTA.md
  *   LOG_SPREADSHEET_ID     必須  実行ログ用スプレッドシート
  *   DEFAULT_PROVIDER       任意  gemini | anthropic | openai（既定 gemini）
- *   GEMINI_API_KEY / GEMINI_MODEL         （既定 gemini-2.0-flash）
+ *   GEMINI_API_KEY / GEMINI_MODEL         （既定 gemini-3.5-flash）
  *   ANTHROPIC_API_KEY / ANTHROPIC_MODEL   （既定 claude-sonnet-4-6）
  *   OPENAI_API_KEY / OPENAI_MODEL         （既定 gpt-4o）
  *   RELAY_WEBHOOK_TOKEN    任意  外部から doPost を叩く場合のみ必須
@@ -70,7 +78,54 @@ function loadConstitution_() {
 }
 
 function readDriveText_(fileId) {
-  return DriveApp.getFileById(fileId).getBlob().getDataAsString('UTF-8');
+  const file = DriveApp.getFileById(fileId);
+  const mime = file.getMimeType();
+  // Googleドキュメント形式（アップロード時に自動変換された場合）は本文のみ抽出
+  if (mime === MimeType.GOOGLE_DOCS) {
+    return DocumentApp.openById(fileId).getBody().getText();
+  }
+  const text = file.getBlob().getDataAsString('UTF-8');
+  // docx/xlsx/zip はマジックナンバー "PK" で始まるバイナリ。文字列化すると
+  // 巨大なゴミが憲法に混入し応答品質を静かに破壊するため明示的に拒否する。
+  if (text.indexOf('PK\u0003\u0004') === 0) {
+    throw new Error(file.getName() + ' は zip 系バイナリ (docx等 / ' + mime +
+      ')。プレーンテキストの .md として再アップロードし、ファイルIDを差し替えること。');
+  }
+  return text;
+}
+
+/**
+ * 診断: 憲法を構成する各ファイルの実体を確認する。
+ * 憲法サイズが想定外（AGENTS+PERSONA で概ね2万文字未満が正常）のとき実行し、
+ * どのファイルが肥大/破損しているかを特定する。
+ */
+function inspectConstitutionFiles() {
+  const targets = [
+    ['AGENTS_MD_FILE_ID', true],
+    ['PERSONA_MD_FILE_ID', true],
+    ['STYLE_DELTA_FILE_ID', false]
+  ];
+  targets.forEach(function (t) {
+    const id = PROPS_.getProperty(t[0]);
+    if (!id) { Logger.log(t[0] + ': 未設定' + (t[1] ? '（必須）' : '（任意）')); return; }
+    try {
+      const file = DriveApp.getFileById(id);
+      let head, len;
+      try {
+        const text = readDriveText_(id);
+        len = text.length;
+        head = text.slice(0, 200).replace(/\n/g, ' / ');
+      } catch (e) {
+        len = '-'; head = '読込エラー: ' + e;
+      }
+      Logger.log(t[0] + ': name=' + file.getName() + ' | mime=' + file.getMimeType() +
+        ' | 文字数=' + len + '\n冒頭: ' + head);
+    } catch (e) {
+      Logger.log(t[0] + ': ファイル取得失敗 — ' + e);
+    }
+  });
+  Logger.log('目安: AGENTS.md 約1,500〜3,000文字 / PERSONA.md 約2,000〜4,000文字。' +
+    '数万文字以上ならIDの取り違えか変換破損を疑う。');
 }
 
 // ------------------------------------------------------------
@@ -176,7 +231,7 @@ function callModelText_(provider, systemText, userText) {
 }
 
 function callGemini_(systemText, messages) {
-  const model = prop_('GEMINI_MODEL', 'gemini-2.0-flash');
+  const model = prop_('GEMINI_MODEL', 'gemini-3.5-flash');
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model +
     ':generateContent?key=' + prop_('GEMINI_API_KEY');
   const payload = {
