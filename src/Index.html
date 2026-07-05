@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root {
+    --bg: #f5f4ef; --panel: #ffffff; --text: #1f1e1b; --sub: #6b6a64;
+    --user: #e8e5db; --border: #dedcd3; --accent: #b25b3e; --ok: #3e7a4e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; font-size: 15px; }
+  #app { max-width: 780px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; background: var(--bg);
+    position: sticky; top: 0; z-index: 2; }
+  header select { font-size: 13px; padding: 4px 6px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--panel); color: var(--text); }
+  #messages { flex: 1; padding: 16px; overflow-y: auto; }
+  .msg { margin-bottom: 16px; max-width: 100%; }
+  .msg .body { white-space: pre-wrap; word-break: break-word; line-height: 1.65;
+    padding: 12px 14px; border-radius: 12px; }
+  .msg.user .body { background: var(--user); margin-left: 15%; }
+  .msg.assistant .body { background: var(--panel); border: 1px solid var(--border); }
+  .msg.system .body { background: transparent; border: 1px dashed var(--border);
+    color: var(--sub); font-size: 13px; }
+  .toolbar { display: flex; gap: 6px; margin-top: 6px; }
+  .toolbar button { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border);
+    border-radius: 14px; background: var(--panel); color: var(--sub); cursor: pointer; }
+  .toolbar button:hover { color: var(--text); border-color: var(--sub); }
+  .toolbar button.active-good { color: var(--ok); border-color: var(--ok); }
+  .toolbar button.active-bad { color: var(--accent); border-color: var(--accent); }
+  .clarify { border: 1px solid var(--accent); border-radius: 12px; padding: 12px 14px;
+    background: #fbf3ef; }
+  .clarify h4 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+  .clarify ul { margin: 0 0 10px; padding-left: 18px; }
+  .clarify li { margin-bottom: 6px; }
+  .clarify .rec { color: var(--sub); font-size: 13px; }
+  #composer { padding: 12px 16px 16px; border-top: 1px solid var(--border);
+    background: var(--bg); position: sticky; bottom: 0; }
+  #composer .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea { flex: 1; resize: none; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 12px; font: inherit; background: var(--panel); min-height: 44px;
+    max-height: 160px; }
+  textarea:focus { outline: none; border-color: var(--sub); }
+  #send { padding: 10px 18px; border: none; border-radius: 12px; background: var(--text);
+    color: #fff; font: inherit; cursor: pointer; }
+  #send:disabled { opacity: 0.4; cursor: default; }
+  #status { font-size: 12px; color: var(--sub); min-height: 16px; margin-top: 6px; }
+  .spinner { display: inline-block; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0.3; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span>RELAY</span>
+    <span>
+      <select id="provider">
+        <option value="">既定プロバイダ</option>
+        <option value="gemini">Gemini</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="openai">OpenAI</option>
+      </select>
+      <button id="newChat" style="font-size:12px;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--panel);cursor:pointer;">新規</button>
+    </span>
+  </header>
+  <div id="messages"></div>
+  <div id="composer">
+    <div class="row">
+      <textarea id="input" placeholder="依頼を入力（Enterで送信 / Shift+Enterで改行）"></textarea>
+      <button id="send">送信</button>
+    </div>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+  // history: サーバへ渡す会話履歴 [{role, text}]。system表示やボタンは含めない。
+  let history = [];
+  let busy = false;
+  let pendingClarifyText = null; // needs_clarification 時の元依頼
+
+  const $messages = document.getElementById('messages');
+  const $input = document.getElementById('input');
+  const $send = document.getElementById('send');
+  const $status = document.getElementById('status');
+  const $provider = document.getElementById('provider');
+
+  document.getElementById('newChat').onclick = function () {
+    if (busy) return;
+    history = []; pendingClarifyText = null;
+    $messages.innerHTML = ''; setStatus('');
+  };
+
+  $input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  $send.onclick = send;
+
+  function setStatus(t, spin) {
+    $status.innerHTML = spin ? '<span class="spinner">●</span> ' + t : t;
+  }
+
+  function setBusy(b) {
+    busy = b; $send.disabled = b; setStatus(b ? '受渡中…' : '', b);
+  }
+
+  function addUserMsg(text) {
+    const div = document.createElement('div');
+    div.className = 'msg user';
+    div.innerHTML = '<div class="body"></div>';
+    div.querySelector('.body').textContent = text;
+    $messages.appendChild(div); scroll();
+  }
+
+  function addAssistantMsg(text, logRow, providerUsed) {
+    const div = document.createElement('div');
+    div.className = 'msg assistant';
+    div.innerHTML =
+      '<div class="body"></div>' +
+      '<div class="toolbar">' +
+      '<button data-act="copy">コピー</button>' +
+      '<button data-act="good">👍</button>' +
+      '<button data-act="bad">👎</button>' +
+      '<button data-act="retry">再試行</button>' +
+      '<span style="font-size:11px;color:var(--sub);align-self:center;">' +
+      (providerUsed || '') + (logRow ? ' / log:' + logRow : '') + '</span>' +
+      '</div>';
+    div.querySelector('.body').textContent = text;
+
+    div.querySelector('[data-act="copy"]').onclick = function () {
+      navigator.clipboard.writeText(text).then(function () { flash(this, 'コピー済'); }.bind(this));
+    };
+    div.querySelector('[data-act="good"]').onclick = function () {
+      sendFeedback(logRow, 5, '', this, 'active-good');
+    };
+    div.querySelector('[data-act="bad"]').onclick = function () {
+      const comment = prompt('何が期待と違ったか（感化ループの材料になる。空でも可）') || '';
+      sendFeedback(logRow, 2, comment, this, 'active-bad');
+    };
+    div.querySelector('[data-act="retry"]').onclick = retryLast;
+
+    $messages.appendChild(div); scroll();
+  }
+
+  function addSystemMsg(html) {
+    const div = document.createElement('div');
+    div.className = 'msg system';
+    div.innerHTML = '<div class="body">' + html + '</div>';
+    $messages.appendChild(div); scroll();
+    return div;
+  }
+
+  function flash(btn, label) {
+    const orig = btn.textContent; btn.textContent = label;
+    setTimeout(function () { btn.textContent = orig; }, 1200);
+  }
+
+  function scroll() { $messages.scrollTop = $messages.scrollHeight; window.scrollTo(0, document.body.scrollHeight); }
+
+  function opts(extra) {
+    const o = extra || {};
+    if ($provider.value) o.provider = $provider.value;
+    return o;
+  }
+
+  function send() {
+    if (busy) return;
+    const text = $input.value.trim();
+    if (!text) return;
+    $input.value = '';
+    addUserMsg(text);
+    history.push({ role: 'user', text: text });
+    callServer(opts({}));
+  }
+
+  function retryLast() {
+    if (busy) return;
+    // 末尾の assistant 応答を捨てて同じ user 発言で再実行
+    if (history.length && history[history.length - 1].role === 'assistant') history.pop();
+    if (!history.length) return;
+    addSystemMsg('再試行中');
+    callServer(opts({}));
+  }
+
+  function callServer(o) {
+    setBusy(true);
+    google.script.run
+      .withSuccessHandler(function (res) {
+        setBusy(false);
+        if (res.status === 'needs_clarification') {
+          pendingClarifyText = history[history.length - 1].text;
+          renderClarification(res.normalized);
+          return;
+        }
+        history.push({ role: 'assistant', text: res.response });
+        addAssistantMsg(res.response, res.logRow, res.provider);
+      })
+      .withFailureHandler(function (err) {
+        setBusy(false);
+        addSystemMsg('エラー: ' + String(err).replace(/</g, '&lt;'));
+      })
+      .uiChat(history, o);
+  }
+
+  function renderClarification(n) {
+    let html = '<div class="clarify"><h4>成果物を左右する曖昧点がある（AGENTS.md 原則2）</h4><ul>';
+    (n.ambiguities || []).forEach(function (a) {
+      html += '<li><b>' + esc(a.point) + '</b><br>候補: ' + esc((a.options || []).join(' / ')) +
+        '<br><span class="rec">推奨: ' + esc(a.recommended || '') + '</span></li>';
+    });
+    html += '</ul>解釈を確定した依頼文を送り直すか、推奨解釈で続行する。<br><br>' +
+      '<button id="forceGo" style="padding:6px 12px;border:1px solid var(--accent);border-radius:8px;background:#fff;color:var(--accent);cursor:pointer;">推奨解釈で続行</button></div>';
+    const div = addSystemMsg(html);
+    div.querySelector('#forceGo').onclick = function () {
+      this.disabled = true;
+      callServer(opts({ skipClarification: true }));
+    };
+  }
+
+  function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+</script>
+</body>
+</html>
