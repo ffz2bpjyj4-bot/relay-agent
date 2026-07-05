@@ -1,0 +1,44 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # Actionsタブから手動実行も可能
+
+jobs:
+  clasp-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # lockfileをコミットしない運用のため npm ci ではなく npm install を使う
+      - run: npm install
+
+      # CIランナーはブラウザを開けないため、認証情報はSecretsから都度生成する。
+      # env経由で展開することでシェルのクオート・改行破損を防ぐ。
+      - name: clasp認証情報を生成
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          CLASP_JSON: ${{ secrets.CLASP_JSON }}
+        run: |
+          cat > ~/.clasprc.json <<< "$CLASPRC_JSON"
+          cat > .clasp.json <<< "$CLASP_JSON"
+
+      - name: push
+        run: npx clasp push --force
+
+      # ウェブアプリ(/exec)のバージョン更新まで自動化したい場合は以下を有効化。
+      # DEPLOYMENT_ID は GASエディタ「デプロイを管理」の既存デプロイIDをSecretsに登録する。
+      # 注意: clasp push はHEAD(エディタ上のコード)を更新するだけで、/execの配信バージョンは
+      # 更新されない。doGet/doPost等の挙動変更を反映するにはデプロイのバージョン更新が必須。
+      #
+      # - name: deploy
+      #   run: npx clasp deploy -i "${{ secrets.DEPLOYMENT_ID }}" -d "auto: ${{ github.sha }}"
+
+      - name: 認証情報を破棄
+        if: always()
+        run: rm -f ~/.clasprc.json .clasp.json

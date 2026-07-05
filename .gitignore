@@ -1,0 +1,8 @@
+# clasp認証情報 — 絶対にコミットしない
+.clasprc.json
+.clasp.json
+
+node_modules/
+package-lock.json
+*.log
+.DS_Store

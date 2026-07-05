@@ -1,0 +1,13 @@
+{
+  "name": "gas-project",
+  "private": true,
+  "version": "1.0.0",
+  "description": "GAS + clasp + GitHub Actions テンプレート",
+  "devDependencies": {
+    "@google/clasp": "3.3.0"
+  },
+  "scripts": {
+    "push": "clasp push --force",
+    "open": "clasp open"
+  }
+}
