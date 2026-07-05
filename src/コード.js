@@ -1,24 +1,26 @@
 /**
  * ============================================================
- * RELAY — 依頼受付・整理・受渡エージェント (GAS) v4
+ * RELAY — 依頼受付・整理・受渡エージェント (GAS) v5
  * ============================================================
- * v3 からの変更点:
- *   [変更] 既定動作を「整理→受渡文の提示」に変更。依頼を送ると
- *          まず正規化し、他のAIにコピペで渡せる「受渡パケット」を
- *          返す。API経由の実行はボタンで明示指示した場合のみ。
- *   [追加] uiOrganize(): 受渡パケット生成（整理文のみ / 憲法込みの
- *          フルプロンプトの両方を返す）。
- *   [追加] 「推奨解釈で続行」時、採用した解釈をパケットに明記。
- *   [改善] callModel_ のエラーメッセージに設定ガイドを追加。
- *   （UI側: Enter送信を廃止しボタン送信のみに変更 — Index.html v2）
+ * v4 からの変更点:
+ *   [変更] 構造化スキーマを刷新: 背景/課題/目的/成果物/完了条件/
+ *          スコープ外/制約/曖昧点/前提/未解決点。「依頼をロジカルに
+ *          まとめる」中核ロジックを強化。
+ *   [追加] 構造化ロジックを外部ファイル ORGANIZER.md へ分離
+ *          （Script Property: ORGANIZER_MD_FILE_ID、任意）。
+ *          未設定時はコード内蔵の既定プロンプトで動作するため、
+ *          設定なしでも従来どおり動く。
+ *   [変更] 受渡パケットが新スキーマの全項目を出力。旧スキーマの
+ *          正規化結果でも欠損項目を読み飛ばして動作する（後方互換）。
  *
- * v3: Gemini 既定を gemini-3.5-flash に更新 / MIME対応リーダ /
- *     inspectConstitutionFiles() 診断関数
+ * v4: 整理→受渡文提示を既定動作化 / uiOrganize / 憲法込みコピー
+ * v3: Gemini 既定を gemini-3.5-flash / MIME対応リーダ / 診断関数
  * v2: testPipeline ログ修正 / チャットUI / 複数ターン対応アダプタ
  *
  * Script Properties:
  *   AGENTS_MD_FILE_ID      必須
  *   PERSONA_MD_FILE_ID     必須
+ *   ORGANIZER_MD_FILE_ID   任意（依頼構造化規約。未設定なら内蔵版）
  *   STYLE_DELTA_FILE_ID    任意
  *   LOG_SPREADSHEET_ID     必須
  *   DEFAULT_PROVIDER       任意  gemini | anthropic | openai（既定 gemini）
@@ -35,7 +37,8 @@
 const PROPS_ = PropertiesService.getScriptProperties();
 const CACHE_ = CacheService.getScriptCache();
 const CONSTITUTION_CACHE_KEY_ = 'relay_constitution_v1';
-const CONSTITUTION_CACHE_SEC_ = 600;
+const ORGANIZER_CACHE_KEY_ = 'relay_organizer_v1';
+const CACHE_SEC_ = 600;
 
 function prop_(key, fallback) {
   const v = PROPS_.getProperty(key);
@@ -46,13 +49,15 @@ function prop_(key, fallback) {
   return v;
 }
 
+/** 憲法・構造化規約のキャッシュを両方消す。Drive上のmd編集後に実行する。 */
 function clearConstitutionCache() {
   CACHE_.remove(CONSTITUTION_CACHE_KEY_);
-  return '憲法キャッシュを削除した。次回読込時に Drive から再取得する。';
+  CACHE_.remove(ORGANIZER_CACHE_KEY_);
+  return 'キャッシュを削除した。次回読込時に Drive から再取得する。';
 }
 
 // ------------------------------------------------------------
-// 憲法（外部ファイル）読込
+// 外部ファイル読込
 // ------------------------------------------------------------
 
 function loadConstitution_() {
@@ -71,9 +76,22 @@ function loadConstitution_() {
 
   const constitution = parts.join('\n\n---\n\n');
   if (constitution.length < 90000) {
-    CACHE_.put(CONSTITUTION_CACHE_KEY_, constitution, CONSTITUTION_CACHE_SEC_);
+    CACHE_.put(CONSTITUTION_CACHE_KEY_, constitution, CACHE_SEC_);
   }
   return constitution;
+}
+
+/** 構造化規約。ORGANIZER_MD_FILE_ID 設定時は Drive 版、未設定時は内蔵版。 */
+function loadOrganizerPrompt_() {
+  const id = PROPS_.getProperty('ORGANIZER_MD_FILE_ID');
+  if (!id) return DEFAULT_ORGANIZER_PROMPT_;
+
+  const cached = CACHE_.get(ORGANIZER_CACHE_KEY_);
+  if (cached) return cached;
+
+  const text = readDriveText_(id);
+  if (text.length < 90000) CACHE_.put(ORGANIZER_CACHE_KEY_, text, CACHE_SEC_);
+  return text;
 }
 
 function readDriveText_(fileId) {
@@ -90,16 +108,17 @@ function readDriveText_(fileId) {
   return text;
 }
 
-/** 診断: 憲法を構成する各ファイルの実体をログ出力する。 */
+/** 診断: 各外部ファイルの実体をログ出力する。 */
 function inspectConstitutionFiles() {
   const targets = [
-    ['AGENTS_MD_FILE_ID', true],
-    ['PERSONA_MD_FILE_ID', true],
-    ['STYLE_DELTA_FILE_ID', false]
+    ['AGENTS_MD_FILE_ID', '必須'],
+    ['PERSONA_MD_FILE_ID', '必須'],
+    ['ORGANIZER_MD_FILE_ID', '任意'],
+    ['STYLE_DELTA_FILE_ID', '任意']
   ];
   targets.forEach(function (t) {
     const id = PROPS_.getProperty(t[0]);
-    if (!id) { Logger.log(t[0] + ': 未設定' + (t[1] ? '（必須）' : '（任意）')); return; }
+    if (!id) { Logger.log(t[0] + ': 未設定（' + t[1] + '）'); return; }
     try {
       const file = DriveApp.getFileById(id);
       let head, len;
@@ -122,24 +141,41 @@ function inspectConstitutionFiles() {
 // Stage 1: 依頼の受け止めと構造化
 // ------------------------------------------------------------
 
-const NORMALIZER_PROMPT_ =
-  'あなたは依頼の交通整理役である。以下の依頼文を読み、後続のAIエージェントが' +
-  '誤解なく着手できる形に構造化せよ。回答は次のキーを持つJSONのみを出力する。' +
-  'Markdownのコードフェンスや前置きは一切付けない。\n' +
+/** 内蔵版の構造化規約。ORGANIZER.md 未設定時のフォールバック（内容は同一）。 */
+const DEFAULT_ORGANIZER_PROMPT_ =
+  'あなたは依頼の交通整理役である。依頼を「実行」しない。後続のAIエージェントが誤解なく着手できる形に依頼を「構造化」することだけが任務である。\n\n' +
+  '## 思考手順（この順で考える）\n' +
+  '1. 背景と課題を分離する。背景＝動かない事実・状況。課題＝解決すべきボトルネック。\n' +
+  '2. 目的をギャップとして定義する。「現状Xだが、理想はY」の形に落とす。手段を目的と取り違えない。手段しか書かれていなければ、その手段が解決する課題を推定し、推定であることを明示する。\n' +
+  '3. 成果物を特定する。何が・どんな形式で納品されれば依頼者は受け取れるか。\n' +
+  '4. 完了条件を機械化する。判定可能な1文。書けなければ null とし、何が決まれば書けるかを open_questions に入れる。\n' +
+  '5. スコープ外を明示する。「今回はやらない」と読めるもの、膨張しがちな隣接領域を挙げる。\n' +
+  '6. 曖昧さを2種に仕分ける。成果物が変わる曖昧さのみ ambiguities（選択肢と推奨付き）。変わらないものは assumptions。迷ったら ambiguities。\n' +
+  '7. 残存論点を open_questions に最大3つ。なければ空配列。\n\n' +
+  '## 出力形式\n' +
+  '次のキーを持つJSONのみを出力する。コードフェンス・前置き・後書きは一切付けない。値は簡潔に（各1〜2文）。\n' +
   '{\n' +
-  '  "objective": "依頼の目的を1文で",\n' +
-  '  "done_definition": "機械的に判定できる完了条件を1文で。書けなければ null",\n' +
+  '  "background": "背景（動かない事実・状況）",\n' +
+  '  "problem": "課題（解決すべきボトルネック）",\n' +
+  '  "objective": "目的（現状→理想のギャップとして1文）",\n' +
+  '  "deliverable": "成果物（何を・どんな形式で）",\n' +
+  '  "done_definition": "機械的に判定できる完了条件を1文。書けなければ null",\n' +
+  '  "out_of_scope": ["今回やらないこと"],\n' +
   '  "constraints": ["明示された制約"],\n' +
-  '  "ambiguities": [{"point": "解釈が割れる点", "options": ["解釈A", "解釈B"], "recommended": "推奨解釈と理由"}],\n' +
-  '  "assumptions": ["解釈が割れるが成果物に影響しないため置く前提"],\n' +
+  '  "ambiguities": [{"point": "解釈が割れる点", "options": ["解釈A", "解釈B"], "recommended": "推奨解釈と理由（1文）"}],\n' +
+  '  "assumptions": ["成果物に影響しないため置いた前提"],\n' +
+  '  "open_questions": ["着手前に確認する価値がある残存論点（最大3、なければ空）"],\n' +
   '  "outcome_affecting": true or false\n' +
-  '}\n' +
-  '判定基準: どの解釈でも成果物が変わらない曖昧さは assumptions に入れ、' +
-  '成果物が変わる曖昧さのみ ambiguities に入れて outcome_affecting を true にする。';
+  '}\n\n' +
+  '## 品質基準\n' +
+  '- 依頼文の言い換えではなく再構造化であること。\n' +
+  '- 推定で補った箇所は「（推定）」を付ける。推定を事実のように書かない。\n' +
+  '- ambiguities の選択肢は互いに排他的で、選ぶと成果物が実際に変わるものだけ。3件以内。\n' +
+  '- 冗長な敬語・感想・助言を書かない。構造化データのみを返す。';
 
 function normalizeRequest(rawText, provider) {
   provider = provider || prop_('DEFAULT_PROVIDER', 'gemini');
-  const raw = callModelText_(provider, NORMALIZER_PROMPT_, '依頼文:\n' + rawText);
+  const raw = callModelText_(provider, loadOrganizerPrompt_(), '依頼文:\n' + rawText);
   return parseJsonLoose_(raw);
 }
 
@@ -156,41 +192,46 @@ function parseJsonLoose_(text) {
 // ------------------------------------------------------------
 
 /**
- * @param {string} rawText  原文
- * @param {Object} n        正規化結果
+ * 新スキーマの全項目を出力。旧スキーマ（項目欠損）でも読み飛ばして動作する。
  * @param {boolean} adoptRecommended  「推奨解釈で続行」により推奨解釈を採用したか
  */
 function buildHandoffPacket_(rawText, n, adoptRecommended) {
-  const lines = [];
-  lines.push('## 依頼（受渡パケット）');
-  lines.push('前段のエージェントが依頼を整理した。与えられた作業規約と応答特性に厳密に従って実行せよ。');
-  lines.push('');
-  lines.push('### 目的');
-  lines.push(n.objective || '(未整理)');
-  lines.push('');
-  lines.push('### 完了条件');
-  lines.push(n.done_definition || '未定義 — 着手前に作業規約の原則1に従い完了条件を1行で提示してから進むこと。');
-  if (n.constraints && n.constraints.length) {
-    lines.push('');
-    lines.push('### 制約');
-    n.constraints.forEach(function (c) { lines.push('- ' + c); });
+  const L = [];
+  function section(title, body) {
+    if (!body) return;
+    L.push('');
+    L.push('### ' + title);
+    L.push(body);
   }
+  function listSection(title, arr, mapper) {
+    if (!arr || !arr.length) return;
+    L.push('');
+    L.push('### ' + title);
+    arr.forEach(function (x) { L.push('- ' + (mapper ? mapper(x) : x)); });
+  }
+
+  L.push('## 依頼（受渡パケット）');
+  L.push('前段のエージェントが依頼を整理した。与えられた作業規約と応答特性に厳密に従って実行せよ。');
+
+  section('背景', n.background);
+  section('課題', n.problem);
+  section('目的', n.objective || '(未整理)');
+  section('成果物', n.deliverable);
+  section('完了条件', n.done_definition ||
+    '未定義 — 着手前に作業規約の原則1に従い完了条件を1行で提示してから進むこと。');
+  listSection('スコープ外（実装しない。必要と考えるなら提案に留める）', n.out_of_scope);
+  listSection('制約', n.constraints);
   if (adoptRecommended && n.ambiguities && n.ambiguities.length) {
-    lines.push('');
-    lines.push('### 採用した解釈（依頼者が推奨解釈での続行を明示指示）');
-    n.ambiguities.forEach(function (a) {
-      lines.push('- ' + a.point + ' → ' + (a.recommended || (a.options && a.options[0]) || ''));
-    });
+    listSection('採用した解釈（依頼者が推奨解釈での続行を明示指示）', n.ambiguities,
+      function (a) { return a.point + ' → ' + (a.recommended || (a.options && a.options[0]) || ''); });
   }
-  if (n.assumptions && n.assumptions.length) {
-    lines.push('');
-    lines.push('### 置いた前提（成果物に影響しないと判断したもの。異なれば申告せよ）');
-    n.assumptions.forEach(function (a) { lines.push('- ' + a); });
-  }
-  lines.push('');
-  lines.push('### 原文');
-  lines.push(rawText);
-  return lines.join('\n');
+  listSection('置いた前提（成果物に影響しないと判断したもの。異なれば申告せよ）', n.assumptions);
+  listSection('未解決点（成果物を左右するものがあれば着手前に1問だけ確認せよ）', n.open_questions);
+
+  L.push('');
+  L.push('### 原文');
+  L.push(rawText);
+  return L.join('\n');
 }
 
 /** 他AIのチャット欄に1回で貼れる、憲法込みのフルプロンプト */
@@ -206,11 +247,6 @@ function buildFullPrompt_(packet) {
 
 /**
  * 整理モード（既定）: 依頼文を正規化し、コピペで他AIに渡せる受渡パケットを返す。
- * ここではAIに依頼を「実行」させない。実行は uiExecute で明示的に行う。
- *
- * @param {string} rawText  依頼文（UI側で追記があれば結合済みの全文）
- * @param {Object} opts {provider, skipClarification}
- * @return {Object} needs_clarification | organized {packet, fullPrompt, normalized, logRow}
  */
 function uiOrganize(rawText, opts) {
   opts = opts || {};
@@ -236,7 +272,6 @@ function uiOrganize(rawText, opts) {
 
 /**
  * 実行モード: 憲法を注入した通常チャット。正規化は行わない。
- * 「APIで実行」ボタン、および実行後の追撃ターンで使用。
  * @param {Array} history [{role:'user'|'assistant', text}]
  */
 function uiChat(history, opts) {
@@ -421,11 +456,13 @@ function proposeStyleDelta() {
   }).join('\n\n');
 
   const prompt =
-    '以下は AI エージェントの低評価事例である。現行の作業規約・応答特性を前提に、' +
+    '以下は AI エージェントの低評価事例である。現行の作業規約・応答特性・構造化規約を前提に、' +
     '再発を防ぐための追加規約を STYLE_DELTA.md への追記案として提案せよ。\n' +
     '要件: 各提案は「## 提案N」「規約文（命令形1〜3文）」「根拠となった事例番号」の形式。' +
     '既存規約の言い換えは提案しない。最大5件。\n\n' +
-    '現行の憲法:\n' + loadConstitution_().slice(0, 20000) + '\n\n低評価事例:\n' + cases;
+    '現行の憲法:\n' + loadConstitution_().slice(0, 20000) +
+    '\n\n現行の構造化規約:\n' + loadOrganizerPrompt_().slice(0, 10000) +
+    '\n\n低評価事例:\n' + cases;
 
   const provider = prop_('DEFAULT_PROVIDER', 'gemini');
   const proposal = callModelText_(provider, 'あなたは規約改善の提案者である。採否は人間が決める。', prompt);
@@ -488,9 +525,15 @@ function testPipeline() {
     return loadConstitution_().length + ' 文字';
   })) return results;
 
+  if (!stage('構造化規約読込', function () {
+    const p = loadOrganizerPrompt_();
+    const src = PROPS_.getProperty('ORGANIZER_MD_FILE_ID') ? 'Drive版' : '内蔵版';
+    return src + ' ' + p.length + ' 文字';
+  })) return results;
+
   if (!stage('正規化', function () {
     const n = normalizeRequest('スプレッドシートAのB列を合計してC1に書くGAS関数を書いて');
-    return 'objective: ' + n.objective;
+    return 'objective: ' + n.objective + ' / deliverable: ' + (n.deliverable || '(旧スキーマ)');
   })) return results;
 
   stage('整理（パケット生成）', function () {
