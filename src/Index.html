@@ -14,36 +14,41 @@
   header { padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center; background: var(--bg);
     position: sticky; top: 0; z-index: 2; }
-  header select { font-size: 13px; padding: 4px 6px; border: 1px solid var(--border);
-    border-radius: 6px; background: var(--panel); color: var(--text); }
+  header select, header button { font-size: 12px; padding: 5px 8px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
   #messages { flex: 1; padding: 16px; overflow-y: auto; }
-  .msg { margin-bottom: 16px; max-width: 100%; }
+  .msg { margin-bottom: 16px; }
   .msg .body { white-space: pre-wrap; word-break: break-word; line-height: 1.65;
     padding: 12px 14px; border-radius: 12px; }
   .msg.user .body { background: var(--user); margin-left: 15%; }
   .msg.assistant .body { background: var(--panel); border: 1px solid var(--border); }
+  .msg.packet .body { background: var(--panel); border: 1px solid var(--ok);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+  .msg.packet .label { font-size: 12px; color: var(--ok); margin-bottom: 4px; font-weight: 600; }
   .msg.system .body { background: transparent; border: 1px dashed var(--border);
     color: var(--sub); font-size: 13px; }
-  .toolbar { display: flex; gap: 6px; margin-top: 6px; }
+  .toolbar { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
   .toolbar button { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border);
     border-radius: 14px; background: var(--panel); color: var(--sub); cursor: pointer; }
   .toolbar button:hover { color: var(--text); border-color: var(--sub); }
+  .toolbar button.primary { color: var(--ok); border-color: var(--ok); }
   .toolbar button.active-good { color: var(--ok); border-color: var(--ok); }
   .toolbar button.active-bad { color: var(--accent); border-color: var(--accent); }
-  .clarify { border: 1px solid var(--accent); border-radius: 12px; padding: 12px 14px;
-    background: #fbf3ef; }
+  .toolbar .meta { font-size: 11px; color: var(--sub); align-self: center; }
+  .clarify { border: 1px solid var(--accent); border-radius: 12px; padding: 12px 14px; background: #fbf3ef; }
   .clarify h4 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
   .clarify ul { margin: 0 0 10px; padding-left: 18px; }
   .clarify li { margin-bottom: 6px; }
   .clarify .rec { color: var(--sub); font-size: 13px; }
+  .clarify button { padding: 6px 12px; border: 1px solid var(--accent); border-radius: 8px;
+    background: #fff; color: var(--accent); cursor: pointer; }
   #composer { padding: 12px 16px 16px; border-top: 1px solid var(--border);
     background: var(--bg); position: sticky; bottom: 0; }
   #composer .row { display: flex; gap: 8px; align-items: flex-end; }
   textarea { flex: 1; resize: none; padding: 10px 12px; border: 1px solid var(--border);
-    border-radius: 12px; font: inherit; background: var(--panel); min-height: 44px;
-    max-height: 160px; }
+    border-radius: 12px; font: inherit; background: var(--panel); min-height: 60px; max-height: 200px; }
   textarea:focus { outline: none; border-color: var(--sub); }
-  #send { padding: 10px 18px; border: none; border-radius: 12px; background: var(--text);
+  #send { padding: 12px 20px; border: none; border-radius: 12px; background: var(--text);
     color: #fff; font: inherit; cursor: pointer; }
   #send:disabled { opacity: 0.4; cursor: default; }
   #status { font-size: 12px; color: var(--sub); min-height: 16px; margin-top: 6px; }
@@ -62,24 +67,27 @@
         <option value="anthropic">Anthropic</option>
         <option value="openai">OpenAI</option>
       </select>
-      <button id="newChat" style="font-size:12px;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--panel);cursor:pointer;">新規</button>
+      <button id="newChat">新規</button>
     </span>
   </header>
   <div id="messages"></div>
   <div id="composer">
     <div class="row">
-      <textarea id="input" placeholder="依頼を入力（Enterで送信 / Shift+Enterで改行）"></textarea>
-      <button id="send">送信</button>
+      <textarea id="input" placeholder="依頼を入力（Enterは改行。送信はボタンのみ）"></textarea>
+      <button id="send">整理する</button>
     </div>
-    <div id="status"></div>
+    <div id="status">依頼を送ると、他のAIに渡せる形に整理して返す。実行はしない。</div>
   </div>
 </div>
 
 <script>
-  // history: サーバへ渡す会話履歴 [{role, text}]。system表示やボタンは含めない。
-  let history = [];
+  // 状態:
+  //   phase 'organize' … 送信テキストを蓄積して整理し直す（実行前）
+  //   phase 'chat'     … APIで実行後の追撃チャット
+  let phase = 'organize';
+  let sourceTexts = [];   // 整理対象の依頼文（追記で再整理できる）
+  let chatHistory = [];   // 実行後のチャット履歴 [{role, text}]
   let busy = false;
-  let pendingClarifyText = null; // needs_clarification 時の元依頼
 
   const $messages = document.getElementById('messages');
   const $input = document.getElementById('input');
@@ -89,80 +97,37 @@
 
   document.getElementById('newChat').onclick = function () {
     if (busy) return;
-    history = []; pendingClarifyText = null;
-    $messages.innerHTML = ''; setStatus('');
+    phase = 'organize'; sourceTexts = []; chatHistory = [];
+    $messages.innerHTML = '';
+    $send.textContent = '整理する';
+    setStatus('依頼を送ると、他のAIに渡せる形に整理して返す。実行はしない。');
   };
 
-  $input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-  });
+  // Enter送信は行わない（Enter=改行）。送信はボタンのみ。
   $send.onclick = send;
 
-  function setStatus(t, spin) {
-    $status.innerHTML = spin ? '<span class="spinner">●</span> ' + t : t;
-  }
+  function setStatus(t, spin) { $status.innerHTML = spin ? '<span class="spinner">●</span> ' + t : t; }
+  function setBusy(b, label) { busy = b; $send.disabled = b; if (b) setStatus(label || '処理中…', true); else setStatus(phase === 'organize' ? '追記して再整理できる。' : '実行後のチャットを継続できる。'); }
+  function scrollDown() { window.scrollTo(0, document.body.scrollHeight); }
+  function opts(extra) { const o = extra || {}; if ($provider.value) o.provider = $provider.value; return o; }
+  function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  function flash(btn, label) { const t = btn.textContent; btn.textContent = label; setTimeout(function () { btn.textContent = t; }, 1200); }
 
-  function setBusy(b) {
-    busy = b; $send.disabled = b; setStatus(b ? '受渡中…' : '', b);
-  }
-
-  function addUserMsg(text) {
+  function addBubble(cls, text, labelHtml) {
     const div = document.createElement('div');
-    div.className = 'msg user';
-    div.innerHTML = '<div class="body"></div>';
+    div.className = 'msg ' + cls;
+    div.innerHTML = (labelHtml || '') + '<div class="body"></div>';
     div.querySelector('.body').textContent = text;
-    $messages.appendChild(div); scroll();
-  }
-
-  function addAssistantMsg(text, logRow, providerUsed) {
-    const div = document.createElement('div');
-    div.className = 'msg assistant';
-    div.innerHTML =
-      '<div class="body"></div>' +
-      '<div class="toolbar">' +
-      '<button data-act="copy">コピー</button>' +
-      '<button data-act="good">👍</button>' +
-      '<button data-act="bad">👎</button>' +
-      '<button data-act="retry">再試行</button>' +
-      '<span style="font-size:11px;color:var(--sub);align-self:center;">' +
-      (providerUsed || '') + (logRow ? ' / log:' + logRow : '') + '</span>' +
-      '</div>';
-    div.querySelector('.body').textContent = text;
-
-    div.querySelector('[data-act="copy"]').onclick = function () {
-      navigator.clipboard.writeText(text).then(function () { flash(this, 'コピー済'); }.bind(this));
-    };
-    div.querySelector('[data-act="good"]').onclick = function () {
-      sendFeedback(logRow, 5, '', this, 'active-good');
-    };
-    div.querySelector('[data-act="bad"]').onclick = function () {
-      const comment = prompt('何が期待と違ったか（感化ループの材料になる。空でも可）') || '';
-      sendFeedback(logRow, 2, comment, this, 'active-bad');
-    };
-    div.querySelector('[data-act="retry"]').onclick = retryLast;
-
-    $messages.appendChild(div); scroll();
-  }
-
-  function addSystemMsg(html) {
-    const div = document.createElement('div');
-    div.className = 'msg system';
-    div.innerHTML = '<div class="body">' + html + '</div>';
-    $messages.appendChild(div); scroll();
+    $messages.appendChild(div); scrollDown();
     return div;
   }
 
-  function flash(btn, label) {
-    const orig = btn.textContent; btn.textContent = label;
-    setTimeout(function () { btn.textContent = orig; }, 1200);
-  }
-
-  function scroll() { $messages.scrollTop = $messages.scrollHeight; window.scrollTo(0, document.body.scrollHeight); }
-
-  function opts(extra) {
-    const o = extra || {};
-    if ($provider.value) o.provider = $provider.value;
-    return o;
+  function addSystem(html) {
+    const div = document.createElement('div');
+    div.className = 'msg system';
+    div.innerHTML = '<div class="body">' + html + '</div>';
+    $messages.appendChild(div); scrollDown();
+    return div;
   }
 
   function send() {
@@ -170,38 +135,66 @@
     const text = $input.value.trim();
     if (!text) return;
     $input.value = '';
-    addUserMsg(text);
-    history.push({ role: 'user', text: text });
-    callServer(opts({}));
+    addBubble('user', text);
+
+    if (phase === 'organize') {
+      sourceTexts.push(text);
+      organize(opts({}));
+    } else {
+      chatHistory.push({ role: 'user', text: text });
+      execChat();
+    }
   }
 
-  function retryLast() {
-    if (busy) return;
-    // 末尾の assistant 応答を捨てて同じ user 発言で再実行
-    if (history.length && history[history.length - 1].role === 'assistant') history.pop();
-    if (!history.length) return;
-    addSystemMsg('再試行中');
-    callServer(opts({}));
-  }
+  // --- 整理フロー ---
 
-  function callServer(o) {
-    setBusy(true);
+  function organize(o) {
+    setBusy(true, '整理中…');
     google.script.run
       .withSuccessHandler(function (res) {
         setBusy(false);
-        if (res.status === 'needs_clarification') {
-          pendingClarifyText = history[history.length - 1].text;
-          renderClarification(res.normalized);
-          return;
-        }
-        history.push({ role: 'assistant', text: res.response });
-        addAssistantMsg(res.response, res.logRow, res.provider);
+        if (res.status === 'needs_clarification') { renderClarification(res.normalized); return; }
+        renderPacket(res);
       })
-      .withFailureHandler(function (err) {
-        setBusy(false);
-        addSystemMsg('エラー: ' + String(err).replace(/</g, '&lt;'));
-      })
-      .uiChat(history, o);
+      .withFailureHandler(fail)
+      .uiOrganize(sourceTexts.join('\n\n【追記】\n'), o);
+  }
+
+  function renderPacket(res) {
+    const div = addBubble('packet', res.packet,
+      '<div class="label">受渡パケット — このまま他のAIに貼れる</div>');
+    const bar = document.createElement('div');
+    bar.className = 'toolbar';
+    bar.innerHTML =
+      '<button class="primary" data-act="copy">整理文をコピー</button>' +
+      '<button data-act="copyfull">憲法込みでコピー</button>' +
+      '<button data-act="exec">このままAPIで実行</button>' +
+      '<button data-act="good">👍</button>' +
+      '<button data-act="bad">👎</button>' +
+      '<span class="meta">' + esc(res.provider) + ' / log:' + res.logRow + '</span>';
+    div.appendChild(bar);
+
+    bar.querySelector('[data-act="copy"]').onclick = function () {
+      navigator.clipboard.writeText(res.packet).then(flash.bind(null, this, 'コピー済'));
+    };
+    bar.querySelector('[data-act="copyfull"]').onclick = function () {
+      navigator.clipboard.writeText(res.fullPrompt).then(flash.bind(null, this, 'コピー済'));
+    };
+    bar.querySelector('[data-act="exec"]').onclick = function () {
+      this.disabled = true;
+      phase = 'chat';
+      $send.textContent = '送信';
+      chatHistory = [{ role: 'user', text: res.packet }];
+      execChat();
+    };
+    bar.querySelector('[data-act="good"]').onclick = function () { sendFeedback(res.logRow, 5, '', this, 'active-good'); };
+    bar.querySelector('[data-act="bad"]').onclick = function () {
+      const c = prompt('整理結果の何が期待と違ったか（空でも可）') || '';
+      sendFeedback(res.logRow, 2, c, this, 'active-bad');
+    };
+
+    addSystem('修正したい点があれば下の入力欄に追記して送信すると再整理する。');
+    scrollDown();
   }
 
   function renderClarification(n) {
@@ -210,16 +203,71 @@
       html += '<li><b>' + esc(a.point) + '</b><br>候補: ' + esc((a.options || []).join(' / ')) +
         '<br><span class="rec">推奨: ' + esc(a.recommended || '') + '</span></li>';
     });
-    html += '</ul>解釈を確定した依頼文を送り直すか、推奨解釈で続行する。<br><br>' +
-      '<button id="forceGo" style="padding:6px 12px;border:1px solid var(--accent);border-radius:8px;background:#fff;color:var(--accent);cursor:pointer;">推奨解釈で続行</button></div>';
-    const div = addSystemMsg(html);
+    html += '</ul>解釈を確定する追記を送信するか、推奨解釈でパケットを生成する。<br><br>' +
+      '<button id="forceGo">推奨解釈でパケット生成</button></div>';
+    const div = addSystem(html);
     div.querySelector('#forceGo').onclick = function () {
       this.disabled = true;
-      callServer(opts({ skipClarification: true }));
+      organize(opts({ skipClarification: true }));
     };
   }
 
-  function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  // --- 実行フロー（憲法注入チャット） ---
+
+  function execChat() {
+    setBusy(true, '実行中…');
+    google.script.run
+      .withSuccessHandler(function (res) {
+        setBusy(false);
+        chatHistory.push({ role: 'assistant', text: res.response });
+        renderAssistant(res);
+      })
+      .withFailureHandler(fail)
+      .uiChat(chatHistory, opts({}));
+  }
+
+  function renderAssistant(res) {
+    const div = addBubble('assistant', res.response);
+    const bar = document.createElement('div');
+    bar.className = 'toolbar';
+    bar.innerHTML =
+      '<button data-act="copy">コピー</button>' +
+      '<button data-act="good">👍</button>' +
+      '<button data-act="bad">👎</button>' +
+      '<button data-act="retry">再試行</button>' +
+      '<span class="meta">' + esc(res.provider) + ' / log:' + res.logRow + '</span>';
+    div.appendChild(bar);
+
+    bar.querySelector('[data-act="copy"]').onclick = function () {
+      navigator.clipboard.writeText(res.response).then(flash.bind(null, this, 'コピー済'));
+    };
+    bar.querySelector('[data-act="good"]').onclick = function () { sendFeedback(res.logRow, 5, '', this, 'active-good'); };
+    bar.querySelector('[data-act="bad"]').onclick = function () {
+      const c = prompt('何が期待と違ったか（空でも可）') || '';
+      sendFeedback(res.logRow, 2, c, this, 'active-bad');
+    };
+    bar.querySelector('[data-act="retry"]').onclick = function () {
+      if (busy) return;
+      if (chatHistory.length && chatHistory[chatHistory.length - 1].role === 'assistant') chatHistory.pop();
+      addSystem('再試行中');
+      execChat();
+    };
+    scrollDown();
+  }
+
+  // --- 共通 ---
+
+  function sendFeedback(logRow, rating, comment, btn, cls) {
+    google.script.run
+      .withSuccessHandler(function () { btn.classList.add(cls); flash(btn, '記録済'); })
+      .withFailureHandler(function (e) { flash(btn, '失敗'); })
+      .uiFeedback(logRow, rating, comment);
+  }
+
+  function fail(err) {
+    setBusy(false);
+    addSystem('エラー: ' + esc(String(err)));
+  }
 </script>
 </body>
 </html>

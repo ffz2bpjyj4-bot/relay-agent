@@ -1,32 +1,31 @@
 /**
  * ============================================================
- * RELAY — 依頼受付・整理・受渡エージェント (GAS) v3
+ * RELAY — 依頼受付・整理・受渡エージェント (GAS) v4
  * ============================================================
- * v2 からの変更点:
- *   [修正] Gemini 既定モデルを gemini-3.5-flash に更新
- *          （gemini-2.0-flash は 2026-06-01 提供終了。HTTP 404 の原因）。
- *   [追加] readDriveText_ を MIME 対応化: Googleドキュメントは
- *          DocumentApp で本文抽出、docx/zip 形式は明示エラー。
- *   [追加] inspectConstitutionFiles(): 憲法ファイルの名称・MIME・
- *          サイズ・冒頭200文字をログ出力する診断関数。
+ * v3 からの変更点:
+ *   [変更] 既定動作を「整理→受渡文の提示」に変更。依頼を送ると
+ *          まず正規化し、他のAIにコピペで渡せる「受渡パケット」を
+ *          返す。API経由の実行はボタンで明示指示した場合のみ。
+ *   [追加] uiOrganize(): 受渡パケット生成（整理文のみ / 憲法込みの
+ *          フルプロンプトの両方を返す）。
+ *   [追加] 「推奨解釈で続行」時、採用した解釈をパケットに明記。
+ *   [改善] callModel_ のエラーメッセージに設定ガイドを追加。
+ *   （UI側: Enter送信を廃止しボタン送信のみに変更 — Index.html v2）
  *
- * v1 からの変更点:
- *   [修正] testPipeline: NG 時に早期 return して Logger.log を通らず
- *          「OKもNGも出ない」状態になるバグを修正。各段階で即時ログ出力。
- *   [追加] チャットWeb UI（doGet + Index.html）。コピー/👍/👎/再試行ボタン。
- *   [変更] アダプタ層を複数ターン対応（messages 配列）に変更。
- *          初回ターンのみ Stage 1 正規化、以降は憲法注入の通常チャット。
+ * v3: Gemini 既定を gemini-3.5-flash に更新 / MIME対応リーダ /
+ *     inspectConstitutionFiles() 診断関数
+ * v2: testPipeline ログ修正 / チャットUI / 複数ターン対応アダプタ
  *
- * Script Properties（必須/任意）:
- *   AGENTS_MD_FILE_ID      必須  Drive 上の AGENTS.md
- *   PERSONA_MD_FILE_ID     必須  Drive 上の PERSONA.md
- *   STYLE_DELTA_FILE_ID    任意  Drive 上の STYLE_DELTA.md
- *   LOG_SPREADSHEET_ID     必須  実行ログ用スプレッドシート
+ * Script Properties:
+ *   AGENTS_MD_FILE_ID      必須
+ *   PERSONA_MD_FILE_ID     必須
+ *   STYLE_DELTA_FILE_ID    任意
+ *   LOG_SPREADSHEET_ID     必須
  *   DEFAULT_PROVIDER       任意  gemini | anthropic | openai（既定 gemini）
  *   GEMINI_API_KEY / GEMINI_MODEL         （既定 gemini-3.5-flash）
  *   ANTHROPIC_API_KEY / ANTHROPIC_MODEL   （既定 claude-sonnet-4-6）
  *   OPENAI_API_KEY / OPENAI_MODEL         （既定 gpt-4o）
- *   RELAY_WEBHOOK_TOKEN    任意  外部から doPost を叩く場合のみ必須
+ *   RELAY_WEBHOOK_TOKEN    任意（doPost を外部公開する場合のみ）
  */
 
 // ------------------------------------------------------------
@@ -80,13 +79,10 @@ function loadConstitution_() {
 function readDriveText_(fileId) {
   const file = DriveApp.getFileById(fileId);
   const mime = file.getMimeType();
-  // Googleドキュメント形式（アップロード時に自動変換された場合）は本文のみ抽出
   if (mime === MimeType.GOOGLE_DOCS) {
     return DocumentApp.openById(fileId).getBody().getText();
   }
   const text = file.getBlob().getDataAsString('UTF-8');
-  // docx/xlsx/zip はマジックナンバー "PK" で始まるバイナリ。文字列化すると
-  // 巨大なゴミが憲法に混入し応答品質を静かに破壊するため明示的に拒否する。
   if (text.indexOf('PK\u0003\u0004') === 0) {
     throw new Error(file.getName() + ' は zip 系バイナリ (docx等 / ' + mime +
       ')。プレーンテキストの .md として再アップロードし、ファイルIDを差し替えること。');
@@ -94,11 +90,7 @@ function readDriveText_(fileId) {
   return text;
 }
 
-/**
- * 診断: 憲法を構成する各ファイルの実体を確認する。
- * 憲法サイズが想定外（AGENTS+PERSONA で概ね2万文字未満が正常）のとき実行し、
- * どのファイルが肥大/破損しているかを特定する。
- */
+/** 診断: 憲法を構成する各ファイルの実体をログ出力する。 */
 function inspectConstitutionFiles() {
   const targets = [
     ['AGENTS_MD_FILE_ID', true],
@@ -124,8 +116,6 @@ function inspectConstitutionFiles() {
       Logger.log(t[0] + ': ファイル取得失敗 — ' + e);
     }
   });
-  Logger.log('目安: AGENTS.md 約1,500〜3,000文字 / PERSONA.md 約2,000〜4,000文字。' +
-    '数万文字以上ならIDの取り違えか変換破損を疑う。');
 }
 
 // ------------------------------------------------------------
@@ -149,7 +139,7 @@ const NORMALIZER_PROMPT_ =
 
 function normalizeRequest(rawText, provider) {
   provider = provider || prop_('DEFAULT_PROVIDER', 'gemini');
-  const raw = callModelText_(provider, NORMALIZER_PROMPT_, rawText.startsWith('依頼文:') ? rawText : '依頼文:\n' + rawText);
+  const raw = callModelText_(provider, NORMALIZER_PROMPT_, '依頼文:\n' + rawText);
   return parseJsonLoose_(raw);
 }
 
@@ -162,43 +152,35 @@ function parseJsonLoose_(text) {
 }
 
 // ------------------------------------------------------------
-// Stage 2: 受渡（handoff）— スクリプト/外部呼び出し用の単発API
+// 受渡パケット生成
 // ------------------------------------------------------------
 
-function handoff(rawText, opts) {
-  opts = opts || {};
-  const provider = opts.provider || prop_('DEFAULT_PROVIDER', 'gemini');
-  const normalized = normalizeRequest(rawText, provider);
-
-  if (normalized.outcome_affecting && !opts.skipClarification) {
-    logRun_(rawText, normalized, provider, '(受渡前に確認質問を返却)', 'clarification');
-    return {
-      status: 'needs_clarification',
-      normalized: normalized,
-      message: '成果物を左右する曖昧点がある。解釈を確定して再実行するか skipClarification:true で推奨解釈により強行する。'
-    };
-  }
-
-  const packet = buildHandoffPacket_(rawText, normalized);
-  const response = callModel_(provider, loadConstitution_(), [{ role: 'user', text: packet }]);
-  const row = logRun_(rawText, normalized, provider, response, 'completed');
-  return { status: 'completed', logRow: row, provider: provider, normalized: normalized, response: response };
-}
-
-function buildHandoffPacket_(rawText, n) {
+/**
+ * @param {string} rawText  原文
+ * @param {Object} n        正規化結果
+ * @param {boolean} adoptRecommended  「推奨解釈で続行」により推奨解釈を採用したか
+ */
+function buildHandoffPacket_(rawText, n, adoptRecommended) {
   const lines = [];
-  lines.push('## 受渡パケット');
-  lines.push('前段のエージェントが依頼を整理した。system に与えた作業規約と応答特性に厳密に従って実行せよ。');
+  lines.push('## 依頼（受渡パケット）');
+  lines.push('前段のエージェントが依頼を整理した。与えられた作業規約と応答特性に厳密に従って実行せよ。');
   lines.push('');
   lines.push('### 目的');
   lines.push(n.objective || '(未整理)');
   lines.push('');
   lines.push('### 完了条件');
-  lines.push(n.done_definition || '未定義 — 着手前に AGENTS.md 原則1 に従い完了条件を1行で提示してから進むこと。');
+  lines.push(n.done_definition || '未定義 — 着手前に作業規約の原則1に従い完了条件を1行で提示してから進むこと。');
   if (n.constraints && n.constraints.length) {
     lines.push('');
     lines.push('### 制約');
     n.constraints.forEach(function (c) { lines.push('- ' + c); });
+  }
+  if (adoptRecommended && n.ambiguities && n.ambiguities.length) {
+    lines.push('');
+    lines.push('### 採用した解釈（依頼者が推奨解釈での続行を明示指示）');
+    n.ambiguities.forEach(function (a) {
+      lines.push('- ' + a.point + ' → ' + (a.recommended || (a.options && a.options[0]) || ''));
+    });
   }
   if (n.assumptions && n.assumptions.length) {
     lines.push('');
@@ -211,9 +193,98 @@ function buildHandoffPacket_(rawText, n) {
   return lines.join('\n');
 }
 
+/** 他AIのチャット欄に1回で貼れる、憲法込みのフルプロンプト */
+function buildFullPrompt_(packet) {
+  return 'あなたはこれから、以下の「作業規約」「応答特性」に従って依頼を実行するエージェントである。' +
+    '規約を読了した上で、末尾の受渡パケットに着手せよ。\n\n' +
+    loadConstitution_() + '\n\n---\n\n' + packet;
+}
+
+// ------------------------------------------------------------
+// UI 向けエントリ
+// ------------------------------------------------------------
+
+/**
+ * 整理モード（既定）: 依頼文を正規化し、コピペで他AIに渡せる受渡パケットを返す。
+ * ここではAIに依頼を「実行」させない。実行は uiExecute で明示的に行う。
+ *
+ * @param {string} rawText  依頼文（UI側で追記があれば結合済みの全文）
+ * @param {Object} opts {provider, skipClarification}
+ * @return {Object} needs_clarification | organized {packet, fullPrompt, normalized, logRow}
+ */
+function uiOrganize(rawText, opts) {
+  opts = opts || {};
+  const provider = opts.provider || prop_('DEFAULT_PROVIDER', 'gemini');
+  const normalized = normalizeRequest(rawText, provider);
+
+  if (normalized.outcome_affecting && !opts.skipClarification) {
+    logRun_(rawText, normalized, provider, '(整理前に確認質問を返却)', 'clarification');
+    return { status: 'needs_clarification', normalized: normalized };
+  }
+
+  const packet = buildHandoffPacket_(rawText, normalized, !!opts.skipClarification);
+  const row = logRun_(rawText, normalized, provider, packet, 'organized');
+  return {
+    status: 'organized',
+    packet: packet,
+    fullPrompt: buildFullPrompt_(packet),
+    normalized: normalized,
+    logRow: row,
+    provider: provider
+  };
+}
+
+/**
+ * 実行モード: 憲法を注入した通常チャット。正規化は行わない。
+ * 「APIで実行」ボタン、および実行後の追撃ターンで使用。
+ * @param {Array} history [{role:'user'|'assistant', text}]
+ */
+function uiChat(history, opts) {
+  opts = opts || {};
+  const provider = opts.provider || prop_('DEFAULT_PROVIDER', 'gemini');
+  const lastUser = history.filter(function (m) { return m.role === 'user'; }).pop();
+  if (!lastUser) throw new Error('user 発言がない');
+
+  const response = callModel_(provider, loadConstitution_(), history);
+  const row = logRun_(lastUser.text, { note: 'execute/chat' }, provider, response, 'completed');
+  return { status: 'completed', response: response, logRow: row, provider: provider };
+}
+
+/** UI の 👍/👎 から呼ぶ。rating: 5=👍, 2=👎 */
+function uiFeedback(logRow, rating, comment) {
+  return recordFeedback(logRow, rating, comment);
+}
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('RELAY')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// ------------------------------------------------------------
+// スクリプト/外部呼び出し用の単発API（doPost が使用）
+// ------------------------------------------------------------
+
+function handoff(rawText, opts) {
+  opts = opts || {};
+  const org = uiOrganize(rawText, opts);
+  if (org.status === 'needs_clarification') {
+    return {
+      status: 'needs_clarification',
+      normalized: org.normalized,
+      message: '成果物を左右する曖昧点がある。解釈を確定して再実行するか skipClarification:true で推奨解釈により強行する。'
+    };
+  }
+  if (opts.organizeOnly) return org;
+
+  const provider = org.provider;
+  const response = callModel_(provider, loadConstitution_(), [{ role: 'user', text: org.packet }]);
+  const row = logRun_(rawText, org.normalized, provider, response, 'completed');
+  return { status: 'completed', logRow: row, provider: provider, normalized: org.normalized, response: response };
+}
+
 // ------------------------------------------------------------
 // アダプタ層（モデル非依存・複数ターン対応）
-// messages: [{role: 'user'|'assistant', text: '...'}]
 // ------------------------------------------------------------
 
 function callModel_(provider, systemText, messages) {
@@ -221,11 +292,12 @@ function callModel_(provider, systemText, messages) {
     case 'gemini': return callGemini_(systemText, messages);
     case 'anthropic': return callAnthropic_(systemText, messages);
     case 'openai': return callOpenAI_(systemText, messages);
-    default: throw new Error('未知の provider: ' + provider);
+    default: throw new Error('未知の provider: ' + provider +
+      ' — DEFAULT_PROVIDER には gemini / anthropic / openai のいずれかを設定する。' +
+      'モデル名は GEMINI_MODEL 等の *_MODEL プロパティに設定する。');
   }
 }
 
-/** 単発テキスト用の薄いラッパ（正規化・提案生成で使用） */
 function callModelText_(provider, systemText, userText) {
   return callModel_(provider, systemText, [{ role: 'user', text: userText }]);
 }
@@ -298,55 +370,6 @@ function fetchJson_(url, options) {
     throw new Error('API エラー HTTP ' + code + ': ' + body.slice(0, 500));
   }
   return JSON.parse(body);
-}
-
-// ------------------------------------------------------------
-// チャットWeb UI（doGet + google.script.run）
-// ------------------------------------------------------------
-
-function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('RELAY')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
-}
-
-/**
- * UI からの1ターン。history は UI が保持する全履歴（末尾が今回の user 発言）。
- * 初回ターン（user 発言が1件のみ）は Stage 1 正規化を通し、成果物を左右する
- * 曖昧さがあれば needs_clarification を返す。2ターン目以降は通常チャット。
- *
- * @param {Array} history [{role:'user'|'assistant', text}]
- * @param {Object} opts {provider, skipClarification}
- * @return {Object} {status, response?, logRow?, normalized?}
- */
-function uiChat(history, opts) {
-  opts = opts || {};
-  const provider = opts.provider || prop_('DEFAULT_PROVIDER', 'gemini');
-  const userTurns = history.filter(function (m) { return m.role === 'user'; });
-  const lastUser = userTurns[userTurns.length - 1];
-  if (!lastUser) throw new Error('user 発言がない');
-
-  const firstTurn = (userTurns.length === 1);
-  let messages = history;
-  let normalized = null;
-
-  if (firstTurn) {
-    normalized = normalizeRequest(lastUser.text, provider);
-    if (normalized.outcome_affecting && !opts.skipClarification) {
-      logRun_(lastUser.text, normalized, provider, '(受渡前に確認質問を返却)', 'clarification');
-      return { status: 'needs_clarification', normalized: normalized };
-    }
-    messages = [{ role: 'user', text: buildHandoffPacket_(lastUser.text, normalized) }];
-  }
-
-  const response = callModel_(provider, loadConstitution_(), messages);
-  const row = logRun_(lastUser.text, normalized || { note: 'chat continuation' }, provider, response, 'completed');
-  return { status: 'completed', response: response, logRow: row, provider: provider };
-}
-
-/** UI の 👍/👎 から呼ぶ。rating: 5=👍, 2=👎 */
-function uiFeedback(logRow, rating, comment) {
-  return recordFeedback(logRow, rating, comment);
 }
 
 // ------------------------------------------------------------
@@ -428,7 +451,11 @@ function doPost(e) {
     return jsonOut_({ error: 'token不一致' });
   }
   try {
-    const result = handoff(body.request, { provider: body.provider, skipClarification: !!body.skipClarification });
+    const result = handoff(body.request, {
+      provider: body.provider,
+      skipClarification: !!body.skipClarification,
+      organizeOnly: !!body.organizeOnly
+    });
     return jsonOut_(result);
   } catch (err) {
     return jsonOut_({ error: String(err) });
@@ -443,10 +470,6 @@ function jsonOut_(obj) {
 // 検証用
 // ------------------------------------------------------------
 
-/**
- * セットアップ検証。v1 は NG 時に Logger.log を通らないバグがあった。
- * v2 は各段階で即時にログ出力するため、実行ログに必ず OK/NG が残る。
- */
 function testPipeline() {
   Logger.log('=== testPipeline 開始 ===');
   const results = [];
@@ -454,14 +477,10 @@ function testPipeline() {
   function stage(name, fn) {
     try {
       const msg = 'OK: ' + name + ' — ' + fn();
-      results.push(msg);
-      Logger.log(msg);
-      return true;
+      results.push(msg); Logger.log(msg); return true;
     } catch (e) {
       const msg = 'NG: ' + name + ' — ' + e;
-      results.push(msg);
-      Logger.log(msg);
-      return false;
+      results.push(msg); Logger.log(msg); return false;
     }
   }
 
@@ -474,9 +493,10 @@ function testPipeline() {
     return 'objective: ' + n.objective;
   })) return results;
 
-  stage('受渡', function () {
-    const r = handoff('FizzBuzzを出力するGAS関数を書いて。完了条件: 1〜15の出力例をログに含める。');
-    return 'status: ' + r.status + (r.logRow ? ' / ログ行: ' + r.logRow : '');
+  stage('整理（パケット生成）', function () {
+    const r = uiOrganize('FizzBuzzを出力するGAS関数を書いて。完了条件: 1〜15の出力例をログに含める。');
+    return 'status: ' + r.status + (r.logRow ? ' / ログ行: ' + r.logRow : '') +
+      (r.packet ? ' / パケット ' + r.packet.length + ' 文字' : '');
   });
 
   Logger.log('=== testPipeline 終了 ===');
