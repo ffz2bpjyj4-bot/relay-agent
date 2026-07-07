@@ -7,7 +7,7 @@
 | Stage | 関数 | 入力 → 出力 | 頭脳ファイル |
 |---|---|---|---|
 | 1 整理 | `uiOrganize` | 依頼文 → 受渡パケット（構造化JSON＋検収条件） | ORGANIZER.md |
-| 2 実行 | `uiChat` / `handoff` | パケット → 納品物（憲法注入で実行） | AGENTS.md + PERSONA.md（+ STYLE_DELTA.md） |
+| 2 実行 | `uiChat` / `handoff` | パケット → 納品物（憲法注入で実行） | AGENTS.md + PERSONA.md + STYLE_CORE.md（+ STYLE_DELTA.md） |
 | 3 検収 | `uiReview` | パケット + 納品物 → 検収JSON（accept/conditional/reject） | REVIEWER.md |
 
 Web UI ではヘッダのドロップダウンで Stage を選んでから送信する。Stage 3 のみパケットと納品物の2欄になる。Stage 1 の「実行(→Stage 2)」、Stage 2 の「検収(→Stage 3)」ボタンで段階を繋げられる。
@@ -22,14 +22,17 @@ Web UI ではヘッダのドロップダウンで Stage を選んでから送信
 | PERSONA.md | 応答特性規約 | Google Drive |
 | ORGANIZER.md | 依頼構造化規約（Stage 1 の頭脳。未設定なら内蔵版） | Google Drive |
 | REVIEWER.md | 納品検収規約（Stage 3 の頭脳。未設定なら内蔵版） | Google Drive |
-| STYLE_DELTA.md | 承認済み追補（感化ループの転記先。最初は空ファイルで可） | Google Drive |
+| STYLE_CORE.md | 応答適用規約（劣化対抗＝依頼分類・反追従・送信前チェック等。PERSONA が参照する基盤。未設定なら内蔵版） | Google Drive |
+| STYLE_DELTA.md | 承認済み増分追補（感化ループの転記先。最下層で上書き優先。最初は空ファイルで可） | Google Drive |
 | ログ用スプレッドシート | 実行記録・評価 | Google Drive |
 
-**内蔵版の同期義務:** ORGANIZER.md / REVIEWER.md は Code.gs 内に同一内容のフォールバック（`DEFAULT_ORGANIZER_PROMPT_` / `DEFAULT_REVIEWER_PROMPT_`）を持つ。Drive 側 .md を改訂したら内蔵版も更新すること。未設定環境での挙動を一致させるためで、`*_MD_FILE_ID` を設定していれば Drive 版が優先される。
+**憲法のロード順（Stage 2）:** AGENTS.md → PERSONA.md → STYLE_CORE.md → STYLE_DELTA.md。STYLE_CORE は PERSONA の適用手続きを具体化する基盤層、STYLE_DELTA は最下層の上書き（承認済み増分）。
+
+**内蔵版の同期義務:** ORGANIZER.md / REVIEWER.md / STYLE_CORE.md は Code.gs 内に同一内容のフォールバック（`DEFAULT_ORGANIZER_PROMPT_` / `DEFAULT_REVIEWER_PROMPT_` / `DEFAULT_STYLE_CORE_PROMPT_`）を持つ。Drive 側 .md を改訂したら内蔵版も更新すること。未設定環境での挙動を一致させるためで、`*_MD_FILE_ID` を設定していれば Drive 版が優先される。
 
 ## セットアップ（依存順）
 
-1. Drive に AGENTS.md / PERSONA.md / ORGANIZER.md / REVIEWER.md / 空の STYLE_DELTA.md をアップロードし、各ファイル ID を控える（URL の `/d/` と `/edit` の間）。ORGANIZER.md / REVIEWER.md は省略可（内蔵版で動く）。
+1. Drive に AGENTS.md / PERSONA.md / ORGANIZER.md / REVIEWER.md / STYLE_CORE.md / 空の STYLE_DELTA.md をアップロードし、各ファイル ID を控える（URL の `/d/` と `/edit` の間）。ORGANIZER.md / REVIEWER.md / STYLE_CORE.md は省略可（内蔵版で動く）。
 2. ログ用スプレッドシートを新規作成し ID を控える。シートは初回実行時に自動作成される。
 3. GAS プロジェクトを作成し Code.gs と Index.html を貼り付ける。既存の gas-clasp-template を使う場合は clasp のバージョン固定（3.x = `tokens`）を維持すること。
 4. プロジェクトの設定 → スクリプト プロパティに以下を登録する。**API キーをコード内に書かないこと。**
@@ -40,6 +43,7 @@ Web UI ではヘッダのドロップダウンで Stage を選んでから送信
    | PERSONA_MD_FILE_ID | 手順1の ID（必須） |
    | ORGANIZER_MD_FILE_ID | 手順1の ID（任意。未設定なら内蔵版） |
    | REVIEWER_MD_FILE_ID | 手順1の ID（任意。未設定なら内蔵版） |
+   | STYLE_CORE_MD_FILE_ID | 手順1の ID（任意。未設定なら内蔵版） |
    | STYLE_DELTA_FILE_ID | 手順1の ID（任意） |
    | LOG_SPREADSHEET_ID | 手順2の ID（必須） |
    | DEFAULT_PROVIDER | gemini / anthropic / openai |
